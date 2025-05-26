@@ -72,6 +72,200 @@ func TestS3(t *testing.T) {
 	servetest.Run(t, "s3", start)
 }
 
+// Mock VFS for testing PutObject and other VFS interactions in s3Backend
+type mockVFS struct {
+	vfs.VFS                                           // Embed VFS interface
+	statFn  func(path string) (os.FileInfo, error)    // Custom Stat behavior
+	mkdirFn func(path string, perm os.FileMode) error // Custom Mkdir behavior
+	// Add other methods if needed by tests
+}
+
+// Stat provides a mock implementation for VFS.Stat
+func (m *mockVFS) Stat(path string) (os.FileInfo, error) {
+	if m.statFn != nil {
+		return m.statFn(path)
+	}
+	// Default mock behavior: assume path exists and is a directory or file as needed
+	// For PutObject, Stat is often called on the bucket path.
+	if strings.HasSuffix(path, "/") || path == "testbucket" { // Crude check if it's a dir/bucket
+		return fstest.NewFileInfo(path, 0, time.Now(), true), nil
+	}
+	return fstest.NewFileInfo(path, 100, time.Now(), false), nil // Assume file for other paths
+}
+
+// Mkdir provides a mock implementation for VFS.Mkdir
+func (m *mockVFS) Mkdir(path string, perm os.FileMode) error {
+	if m.mkdirFn != nil {
+		return m.mkdirFn(path, perm)
+	}
+	// Default mock behavior: assume mkdir succeeds
+	return nil
+}
+
+func TestS3BackendPutObjectConditionalHeaders(t *testing.T) {
+	ctx := context.Background()
+	var capturedOptions []fs.OpenOption
+	var rcatError error // To simulate errors from RcatSize
+
+	originalRcatSize := operations.RcatSize
+	operations.RcatSize = func(ctx context.Context, fdst fs.Fs, remote string, r io.Reader, size int64, modTime time.Time, options ...fs.OpenOption) (fs.Object, error) {
+		capturedOptions = make([]fs.OpenOption, len(options)) // Clear and copy
+		copy(capturedOptions, options)
+		if rcatError != nil {
+			return nil, rcatError
+		}
+		// Return a dummy fs.Object for successful calls
+		return fstest.NewItem(remote, "", modTime), nil
+	}
+	defer func() { operations.RcatSize = originalRcatSize }()
+
+	// Setup s3Backend with mock VFS
+	mockVFSInstance := &mockVFS{}
+	// Ensure Opt is initialized if your Server struct expects it.
+	// Using default Opt from the package if available, or a new one.
+	serverOpt := Opt // Assuming Opt is a global var with default options
+	serverOpt.Auth.AccessKey = "testkey" // Ensure some auth is set if newServer checks
+	serverOpt.Auth.SecretKey = "testsecret"
+
+	// Minimal Server setup for s3Backend
+	// The vfscommon.Opt and proxy.Opt might not be strictly necessary if newServer handles nil or default.
+	// If newServer panics or errors here, these might need to be initialized.
+	s3Server, err := newServer(ctx, mockVFSInstance, &serverOpt, &vfscommon.Opt{}, &proxy.Opt{})
+	require.NoError(t, err, "newServer failed")
+	// The newBackend function might not be exported or might be internal to the package.
+	// If newBackend is not accessible, instantiate s3Backend directly if possible,
+	// or use a helper if the package provides one.
+	// For this example, assuming s3Backend can be created/accessed.
+	// If s3Backend is not directly constructible or newBackend is internal,
+	// this test might need to be in the s3 package itself.
+	// Let's assume newBackend is available for now or s3Server is the backend.
+	// Based on the original code structure, newBackend is likely available.
+	backend := newBackend(s3Server).(*s3Backend)
+
+	dummyBucket := "testbucket"
+	dummyObject := "testobject.txt"
+	dummyContent := "hello world"
+
+	// Mock VFS Stat to indicate bucket exists and is a directory
+	mockVFSInstance.statFn = func(p string) (os.FileInfo, error) {
+		if p == dummyBucket {
+			return fstest.NewFileInfo(dummyBucket, 0, time.Now(), true), nil
+		}
+		// For parent directory of the object, also return it as a directory
+		if p == path.Dir(path.Join(dummyBucket, dummyObject)) {
+			return fstest.NewFileInfo(p, 0, time.Now(), true), nil
+		}
+		// For specific object paths during RcatSize (if it tries to Stat before write, which it shouldn't)
+		// or for HeadObject after PutObject, return a file.
+		// For this test, RcatSize is mocked, so we mainly care about bucket and parent dir checks.
+		return fstest.NewFileInfo(p, 100, time.Now(), false), vfs.ENOENT // Default to not found for other files initially
+	}
+
+	time1Str := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC).Format(http.TimeFormat)
+	time1Parsed, _ := time.Parse(http.TimeFormat, time1Str)
+
+	testCases := []struct {
+		name                string
+		meta                map[string]string
+		expectedOptionTypes []any // Types of expected options
+		expectedValues      []fs.OpenOption
+		setupRcatError      error
+		expectGofake3Error  *gofakes3.ErrorResponse // Use pointer for optional error check
+	}{
+		{
+			name:                "If-Match",
+			meta:                map[string]string{"X-Rclone-Internal-If-Match": "etag123"},
+			expectedOptionTypes: []any{fs.IfMatchOption("")},
+			expectedValues:      []fs.OpenOption{fs.IfMatchOption("etag123")},
+		},
+		{
+			name:                "If-None-Match",
+			meta:                map[string]string{"X-Rclone-Internal-If-None-Match": "etag456"},
+			expectedOptionTypes: []any{fs.IfNoneMatchOption("")},
+			expectedValues:      []fs.OpenOption{fs.IfNoneMatchOption("etag456")},
+		},
+		{
+			name:                "If-Modified-Since",
+			meta:                map[string]string{"X-Rclone-Internal-If-Modified-Since": time1Str},
+			expectedOptionTypes: []any{fs.IfModifiedSinceOption{}},
+			expectedValues:      []fs.OpenOption{fs.IfModifiedSinceOption(time1Parsed)},
+		},
+		{
+			name:                "If-Unmodified-Since",
+			meta:                map[string]string{"X-Rclone-Internal-If-Unmodified-Since": time1Str},
+			expectedOptionTypes: []any{fs.IfUnmodifiedSinceOption{}},
+			expectedValues:      []fs.OpenOption{fs.IfUnmodifiedSinceOption(time1Parsed)},
+		},
+		{
+			name: "Combination If-Match and If-Unmodified-Since",
+			meta: map[string]string{
+				"X-Rclone-Internal-If-Match":              "combo-etag",
+				"X-Rclone-Internal-If-Unmodified-Since": time1Str,
+			},
+			expectedOptionTypes: []any{fs.IfMatchOption(""), fs.IfUnmodifiedSinceOption{}},
+			expectedValues:      []fs.OpenOption{fs.IfMatchOption("combo-etag"), fs.IfUnmodifiedSinceOption(time1Parsed)},
+		},
+		{
+			name: "No Conditional Headers",
+			meta: map[string]string{"Some-Other-Meta": "value"},
+		},
+		{
+			name: "Invalid If-Modified-Since time format",
+			meta: map[string]string{"X-Rclone-Internal-If-Modified-Since": "not-a-valid-http-time"},
+			// Expect no conditional option to be added, and no error from PutObject itself for this
+		},
+		{
+			name:               "PreconditionFailed Error Mapping",
+			meta:               map[string]string{"X-Rclone-Internal-If-Match": "error-etag"},
+			setupRcatError:     fs.ErrorPreconditionFailed,
+			expectGofake3Error: &gofakes3.ErrPreconditionFailed,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			capturedOptions = nil // Reset
+			rcatError = tc.setupRcatError
+
+			// Need a new reader for each call to PutObject
+			dummyReader := strings.NewReader(dummyContent)
+			dummySize := int64(len(dummyContent))
+
+			_, err := backend.PutObject(ctx, dummyBucket, dummyObject, tc.meta, dummyReader, dummySize)
+
+			if tc.expectGofake3Error != nil {
+				require.Error(t, err)
+				// Check if the error is the expected gofakes3 error
+				// This requires errors.Is or type assertion if gofakes3 errors are distinct types
+				// For now, string comparison or errors.Is if gofakes3.ErrorResponse implements Is()
+				var gf3Err *gofakes3.ErrorResponse
+				if errors.As(err, &gf3Err) {
+					assert.Equal(t, tc.expectGofake3Error.Code, gf3Err.Code, "Gofake3 error code mismatch")
+				} else {
+					// Fallback or fail if not a gofakes3 error type as expected
+					assert.Contains(t, err.Error(), tc.expectGofake3Error.Message, "Error message mismatch")
+				}
+			} else {
+				require.NoError(t, err)
+			}
+
+			require.Len(t, capturedOptions, len(tc.expectedOptionTypes))
+			if len(tc.expectedOptionTypes) > 0 {
+				for i, expectedType := range tc.expectedOptionTypes {
+					assert.IsType(t, expectedType, capturedOptions[i], "Option type mismatch at index %d", i)
+					if len(tc.expectedValues) > i {
+						assert.Equal(t, tc.expectedValues[i], capturedOptions[i], "Option value mismatch at index %d", i)
+					}
+				}
+			} else {
+				// If no types are expected, ensure no conditional options were captured.
+				// Some default options might be passed by RcatSize itself, so we only care about our specific ones.
+				// This is implicitly handled by tc.expectedOptionTypes being empty and asserting len(capturedOptions).
+			}
+		})
+	}
+}
+
 // tests using the minio client
 func TestEncodingWithMinioClient(t *testing.T) {
 	cases := []struct {

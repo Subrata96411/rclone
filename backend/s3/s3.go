@@ -6188,6 +6188,12 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 	var mReq s3.CreateMultipartUploadInput
 	setFrom_s3CreateMultipartUploadInput_s3PutObjectInput(&mReq, ui.req)
 
+	// Ensure conditional headers from PutObjectInput are copied to CreateMultipartUploadInput
+	mReq.IfMatch = ui.req.IfMatch
+	mReq.IfNoneMatch = ui.req.IfNoneMatch
+	mReq.IfModifiedSince = ui.req.IfModifiedSince
+	mReq.IfUnmodifiedSince = ui.req.IfUnmodifiedSince
+
 	uploadParts := f.opt.MaxUploadParts
 	if uploadParts < 1 {
 		uploadParts = 1
@@ -6661,6 +6667,15 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 			ui.req.ContentType = aws.String(value)
 		case "x-amz-tagging":
 			ui.req.Tagging = aws.String(value)
+		// Handle conditional upload options
+		case fs.IfMatchOption:
+			ui.req.IfMatch = aws.String(string(option.(fs.IfMatchOption)))
+		case fs.IfNoneMatchOption:
+			ui.req.IfNoneMatch = aws.String(string(option.(fs.IfNoneMatchOption)))
+		case fs.IfModifiedSinceOption:
+			ui.req.IfModifiedSince = aws.Time(time.Time(option.(fs.IfModifiedSinceOption)))
+		case fs.IfUnmodifiedSinceOption:
+			ui.req.IfUnmodifiedSince = aws.Time(time.Time(option.(fs.IfUnmodifiedSinceOption)))
 		default:
 			const amzMetaPrefix = "x-amz-meta-"
 			if strings.HasPrefix(lowerKey, amzMetaPrefix) {

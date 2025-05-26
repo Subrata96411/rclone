@@ -277,6 +277,78 @@ func (o MetadataOption) Mandatory() bool {
 	return false
 }
 
+// IfMatchOption is an option to conditionally upload if the etag matches.
+type IfMatchOption string
+
+// Header returns the header for this option.
+func (o IfMatchOption) Header() (key string, value string) {
+	return "If-Match", string(o)
+}
+
+// Mandatory returns whether this option is mandatory.
+func (o IfMatchOption) Mandatory() bool {
+	return false
+}
+
+// String formats the option into human-readable form
+func (o IfMatchOption) String() string {
+	return fmt.Sprintf("IfMatchOption(%q)", string(o))
+}
+
+// IfNoneMatchOption is an option to conditionally upload if the etag does not match.
+type IfNoneMatchOption string
+
+// Header returns the header for this option.
+func (o IfNoneMatchOption) Header() (key string, value string) {
+	return "If-None-Match", string(o)
+}
+
+// Mandatory returns whether this option is mandatory.
+func (o IfNoneMatchOption) Mandatory() bool {
+	return false
+}
+
+// String formats the option into human-readable form
+func (o IfNoneMatchOption) String() string {
+	return fmt.Sprintf("IfNoneMatchOption(%q)", string(o))
+}
+
+// IfModifiedSinceOption is an option to conditionally upload if the object has not been modified since the given time.
+type IfModifiedSinceOption time.Time
+
+// Header returns the header for this option.
+func (o IfModifiedSinceOption) Header() (key string, value string) {
+	return "If-Modified-Since", time.Time(o).Format(http.TimeFormat)
+}
+
+// Mandatory returns whether this option is mandatory.
+func (o IfModifiedSinceOption) Mandatory() bool {
+	return false
+}
+
+// String formats the option into human-readable form
+func (o IfModifiedSinceOption) String() string {
+	return fmt.Sprintf("IfModifiedSinceOption(%q)", time.Time(o).Format(http.TimeFormat))
+}
+
+// IfUnmodifiedSinceOption is an option to conditionally upload if the object has been modified since the given time.
+type IfUnmodifiedSinceOption time.Time
+
+// Header returns the header for this option.
+func (o IfUnmodifiedSinceOption) Header() (key string, value string) {
+	return "If-Unmodified-Since", time.Time(o).Format(http.TimeFormat)
+}
+
+// Mandatory returns whether this option is mandatory.
+func (o IfUnmodifiedSinceOption) Mandatory() bool {
+	return false
+}
+
+// String formats the option into human-readable form
+func (o IfUnmodifiedSinceOption) String() string {
+	return fmt.Sprintf("IfUnmodifiedSinceOption(%q)", time.Time(o).Format(http.TimeFormat))
+}
+
 // MetadataAsOpenOptions fetch any metadata to set as open options
 func MetadataAsOpenOptions(ctx context.Context) (options []OpenOption) {
 	ci := GetConfig(ctx)

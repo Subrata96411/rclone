@@ -315,45 +315,81 @@ func (b *s3Backend) PutObject(
 		}
 	}
 
-	f, err := _vfs.Create(fp)
-	if err != nil {
-		return result, err
-	}
-
-	if _, err := io.Copy(f, input); err != nil {
-		// remove file when i/o error occurred (FsPutErr)
-		_ = f.Close()
-		_ = _vfs.Remove(fp)
-		return result, err
-	}
-
-	if err := f.Close(); err != nil {
-		// remove file when close error occurred (FsPutErr)
-		_ = _vfs.Remove(fp)
-		return result, err
-	}
-
-	_, err = _vfs.Stat(fp)
-	if err != nil {
-		return result, err
-	}
-
-	b.meta.Store(fp, meta)
-
-	if val, ok := meta["X-Amz-Meta-Mtime"]; ok {
-		ti, err := swift.FloatStringToTime(val)
-		if err == nil {
-			b.storeModtime(fp, meta, val)
-			return result, _vfs.Chtimes(fp, ti, ti)
+	// Determine modTime for RcatSize
+	modTime := time.Now()
+	if mtimeStr, ok := meta["x-amz-meta-mtime"]; ok { // S3 specific metadata
+		if t, err := swift.FloatStringToTime(mtimeStr); err == nil {
+			modTime = t
+		} else {
+			fs.Debugf("serve s3", "Failed to parse x-amz-meta-mtime %q: %v", mtimeStr, err)
 		}
-		// ignore error since the file is successfully created
-
-		if val, ok := meta["mtime"]; ok {
-			b.storeModtime(fp, meta, val)
-			return result, _vfs.Chtimes(fp, ti, ti)
+	} else if mtimeStr, ok := meta["mtime"]; ok { // Internal metadata if already processed
+		if t, err := swift.FloatStringToTime(mtimeStr); err == nil {
+			modTime = t
+		} else {
+			fs.Debugf("serve s3", "Failed to parse mtime %q: %v", mtimeStr, err)
 		}
-		// ignore error since the file is successfully created
 	}
+
+	// Construct fs.OpenOption slice from meta for conditional headers
+	var openOptions []fs.OpenOption
+	// Using X-Rclone-Internal-* prefix as a workaround until gofakes3 supports these natively
+	if ifMatchEtag, ok := meta["X-Rclone-Internal-If-Match"]; ok && ifMatchEtag != "" {
+		openOptions = append(openOptions, fs.IfMatchOption(ifMatchEtag))
+	}
+	if ifNoneMatchEtag, ok := meta["X-Rclone-Internal-If-None-Match"]; ok && ifNoneMatchEtag != "" {
+		openOptions = append(openOptions, fs.IfNoneMatchOption(ifNoneMatchEtag))
+	}
+	if ifModSinceStr, ok := meta["X-Rclone-Internal-If-Modified-Since"]; ok && ifModSinceStr != "" {
+		// S3 specific headers use RFC1123 format
+		if t, err := http.ParseTime(ifModSinceStr); err == nil {
+			openOptions = append(openOptions, fs.IfModifiedSinceOption(t))
+		} else {
+			fs.Debugf("serve s3", "Failed to parse X-Rclone-Internal-If-Modified-Since %q: %v. Expected RFC1123 format.", ifModSinceStr, err)
+			// According to S3 spec, an invalid date format for If-Modified-Since might be ignored or result in an error.
+			// For now, we log and ignore. If strict S3 behavior is needed, an error should be returned.
+			// return result, gofakes3.ErrInvalidRequest // Or a more specific error
+		}
+	}
+	if ifUnmodSinceStr, ok := meta["X-Rclone-Internal-If-Unmodified-Since"]; ok && ifUnmodSinceStr != "" {
+		// S3 specific headers use RFC1123 format
+		if t, err := http.ParseTime(ifUnmodSinceStr); err == nil {
+			openOptions = append(openOptions, fs.IfUnmodifiedSinceOption(t))
+		} else {
+			fs.Debugf("serve s3", "Failed to parse X-Rclone-Internal-If-Unmodified-Since %q: %v. Expected RFC1123 format.", ifUnmodSinceStr, err)
+			// Similar to If-Modified-Since, log and ignore for now.
+			// return result, gofakes3.ErrInvalidRequest // Or a more specific error
+		}
+	}
+
+	// Use operations.RcatSize to handle the upload with options
+	// _vfs is an fs.Fs, fp is the remote path
+	newObj, err := operations.RcatSize(ctx, _vfs, fp, input, size, modTime, openOptions...)
+	if err != nil {
+		// Attempt to map fs errors to gofakes3 errors
+		if errors.Is(err, fs.ErrorPreconditionFailed) {
+			return result, gofakes3.ErrPreconditionFailed
+		}
+		// Add more specific error mappings if needed, e.g. fs.ErrorNotModified
+		// For now, fall back to internal error for other RcatSize failures.
+		fs.Errorf("serve s3", "RcatSize failed for %q: %v", fp, err)
+		return result, gofakes3.ErrInternal
+	}
+
+	// RcatSize has already set the modTime.
+	// We store the client-provided 'meta' map as gofakes3 expects.
+	// Any x-amz-meta-* headers from the original request are in 'meta'.
+	// 'operations.RcatSize' itself doesn't directly consume this 'meta' map for fs.Object metadata,
+	// but it does take `modTime`. If other `x-amz-meta-*` headers need to be translated to
+	// `fs.OpenOption` for `RcatSize`, that would be an extension here.
+	b.meta.Store(fp, meta) // Store original meta for gofakes3 compatibility and retrieval in Head/GetObject
+
+	// Populate result from the fs.Object returned by RcatSize
+	result.ETag = getFileHash(newObj, b.s.etagHashType) // getFileHash is an existing helper
+	result.LastModified = gofakes3.NewContentTime(newObj.ModTime(ctx))
+	// gofakes3.PutObjectResult has no direct field for version ID.
+	// If versioning were fully implemented and returned by RcatSize/VFS,
+	// and gofakes3 supported it, it would be set here.
 
 	return result, nil
 }
